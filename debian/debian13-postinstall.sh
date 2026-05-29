@@ -1,0 +1,418 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+# ============================================================
+# Root check (shared)
+# ============================================================
+if [ "$EUID" -ne 0 ]; then
+  echo "Please run as root."
+  exit 1
+fi
+
+# ============================================================
+# Colors (TTY safe)
+# ============================================================
+if [ -t 1 ]; then
+  C_RESET="\033[0m"
+  C_BOLD="\033[1m"
+  C_RED="\033[31m"
+  C_GREEN="\033[32m"
+  C_YELLOW="\033[33m"
+  C_BLUE="\033[34m"
+  C_MAGENTA="\033[35m"
+  C_CYAN="\033[36m"
+else
+  C_RESET=""; C_BOLD=""; C_RED=""; C_GREEN=""; C_YELLOW=""
+  C_BLUE=""; C_MAGENTA=""; C_CYAN=""
+fi
+
+# pretty printers
+info()    { printf "${C_BLUE}==>${C_RESET} %s\n" "$*"; }
+ok()      { printf "${C_GREEN}✔${C_RESET} %s\n" "$*"; }
+warn()    { printf "${C_YELLOW}!${C_RESET} %s\n" "$*"; }
+error()   { printf "${C_RED}✖ %s${C_RESET}\n" "$*"; }
+section() { printf "\n${C_BOLD}${C_MAGENTA}=== %s ===${C_RESET}\n\n" "$*"; }
+
+trap 'error "Script failed on line $LINENO"' ERR
+
+# ============================================================
+# Banner
+# ============================================================
+print_banner() {
+  local host="$(hostname)"
+  local date="$(date)"
+
+  printf "${C_BOLD}${C_CYAN}"
+
+  cat <<'EOF'
+ _____     ______     ______     __     ______     __   __        ______   ______     ______     ______   __     __   __     ______     ______
+/\  __-.  /\  ___\   /\  == \   /\ \   /\  __ \   /\ "-.\ \      /\  == \ /\  __ \   /\  ___\   /\__  _\ /\ \   /\ "-.\ \   /\  ___\   /\__  _\
+\ \ \/\ \ \ \  __\   \ \  __<   \ \ \  \ \  __ \  \ \ \-.  \     \ \  _-/ \ \ \/\ \  \ \___  \  \/_/\ \/ \ \ \  \ \ \-.  \  \ \___  \  \/_/\ \/
+ \ \____-  \ \_____\  \ \_____\  \ \_\  \ \_\ \_\  \ \_\\"\_\     \ \_\    \ \_____\  \/\_____\    \ \_\  \ \_\  \ \_\\"\_\  \/\_____\    \ \_\
+  \/____/   \/_____/   \/_____/   \/_/   \/_/\/_/   \/_/ \/_/      \/_/     \/_____/   \/_____/     \/_/   \/_/   \/_/ \/_/   \/_____/     \/_/
+
+        Debian 13 Server Setup
+EOF
+
+  printf "\n  Host: %s\n" "$host"
+  printf "  Date: %s\n" "$date"
+  printf "${C_RESET}\n\n"
+}
+
+# ============================================================
+# HEADER
+# ============================================================
+[ -t 1 ] && printf "\033c"
+print_banner
+
+# ============================================================
+# SECTION 1 — Debian 13 Post Install Network Setup
+# ============================================================
+section "Debian 13 Post Install Network Setup"
+echo
+
+# ---- Default auto-detection ----
+DEFAULT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{print $5; exit}')
+DEFAULT_IFACE=${DEFAULT_IFACE:-$(ip -o link show | awk -F': ' '{print $2}' | grep -E '^(en|eth)' | head -n1)}
+DEFAULT_IFACE=${DEFAULT_IFACE:-eth0}
+DEFAULT_IP="192.168.88.20/24"
+DEFAULT_GW="192.168.88.1"
+DEFAULT_DNS="192.168.88.1"
+DEFAULT_FALLBACK="8.8.8.8"
+
+[ -t 0 ] || { error "Script must be run interactively"; exit 1; }
+
+CURRENT_HOSTNAME=$(hostname)
+read -e -p "Enter hostname: " -i "$CURRENT_HOSTNAME" NEW_HOSTNAME
+hostnamectl set-hostname "$NEW_HOSTNAME"
+ok "Hostname set to $NEW_HOSTNAME"
+
+section "Updating /etc/hosts"
+
+cp /etc/hosts /etc/hosts.bak
+
+# remove existing hostname mapping
+sed -i '/^127\.0\.1\.1/d' /etc/hosts
+
+# add new hostname mapping
+echo "127.0.1.1 $NEW_HOSTNAME" >> /etc/hosts
+
+ok "/etc/hosts updated"
+
+# ---- Prompts with prefilled values ----
+ip -br link
+read -e -p "Enter network interface name: " -i "$DEFAULT_IFACE" INTERFACE
+
+read -e -p "Use DHCP instead of static IP? (yes/no): " -i "yes" USE_DHCP
+case "$USE_DHCP" in
+  yes|no) ;;
+  *) error "Please enter yes or no"; exit 1 ;;
+esac
+
+ip link show "$INTERFACE" >/dev/null 2>&1 || { error "Interface not found"; exit 1; }
+if [ "$USE_DHCP" != "yes" ]; then
+  read -e -p "Enter static IP with CIDR: " -i "$DEFAULT_IP" IP
+  read -e -p "Enter gateway IP: " -i "$DEFAULT_GW" GATEWAY
+  read -e -p "Enter primary DNS server IP: " -i "$DEFAULT_DNS" DNS_SERVER
+  read -e -p "Enter fallback DNS server IP: " -i "$DEFAULT_FALLBACK" FALLBACK_DNS
+fi
+
+valid_ipv4() {
+  local ip=$1
+  local IFS=.
+  local -a octets
+
+  [[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r -a octets <<< "$ip"
+
+  for octet in "${octets[@]}"; do
+    (( octet >= 0 && octet <= 255 )) || return 1
+  done
+}
+
+valid_cidr_ipv4() {
+  local cidr=$1
+  local ip mask
+
+  [[ $cidr == */* ]] || return 1
+  ip=${cidr%/*}
+  mask=${cidr#*/}
+
+  valid_ipv4 "$ip" || return 1
+  [[ $mask =~ ^([0-9]|[1-2][0-9]|3[0-2])$ ]]
+}
+
+if [ "$USE_DHCP" != "yes" ]; then
+  valid_cidr_ipv4 "$IP" || { error "Invalid static IP/CIDR"; exit 1; }
+  valid_ipv4 "$GATEWAY" || { error "Invalid gateway IP"; exit 1; }
+  valid_ipv4 "$DNS_SERVER" || { error "Invalid primary DNS IP"; exit 1; }
+  valid_ipv4 "$FALLBACK_DNS" || { error "Invalid fallback DNS IP"; exit 1; }
+fi
+
+echo
+echo "Configuration summary:"
+echo "Interface: $INTERFACE"
+
+if [ "$USE_DHCP" = "yes" ]; then
+  echo "Mode: DHCP"
+else
+  echo "Mode: Static"
+  echo "IP: $IP"
+  echo "Gateway: $GATEWAY"
+  echo "Primary DNS: $DNS_SERVER"
+  echo "Fallback DNS: $FALLBACK_DNS"
+fi
+
+read -e -p "Proceed? (yes/no): " -i "yes" CONFIRM
+[ "$CONFIRM" != "yes" ] && { warn "Aborted."; exit 1; }
+
+echo
+section "Updating system"
+apt update >/dev/null 2>&1 || { error "APT update failed"; exit 1; }
+DEBIAN_FRONTEND=noninteractive apt full-upgrade -y >/dev/null || { error "Upgrade failed"; exit 1; }
+ok "System upgraded"
+
+section "Installing required packages"
+DEBIAN_FRONTEND=noninteractive apt install -y qemu-guest-agent sudo curl systemd-resolved systemd-timesyncd \
+  >/dev/null 2>&1 || { error "Package installation failed"; exit 1; }
+ok "Base packages installed"
+section "Limiting journal size"
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/size.conf <<EOF
+[Journal]
+SystemMaxUse=200M
+RuntimeMaxUse=50M
+MaxRetentionSec=2week
+EOF
+
+mkdir -p /var/log/journal
+systemctl restart systemd-journald
+journalctl --vacuum-size=200M >/dev/null 2>&1 || true
+ok "journald limited"
+
+systemctl enable --now qemu-guest-agent
+ok "QEMU Guest Agent enabled"
+
+section "Removing old network stacks"
+DEBIAN_FRONTEND=noninteractive apt purge -y network-manager netplan.io ifupdown >/dev/null 2>&1 || true
+rm -rf /etc/network 2>/dev/null || true
+rm -rf /etc/netplan 2>/dev/null || true
+
+section "Enabling systemd services"
+systemctl enable --now systemd-networkd
+systemctl enable --now systemd-resolved
+systemctl enable --now systemd-timesyncd
+
+section "Configuring locale and timezone"
+
+# ensure locales package
+DEBIAN_FRONTEND=noninteractive apt install -y locales >/dev/null 2>&1
+
+# create locale.gen if missing
+grep -q '^en_US.UTF-8 UTF-8' /etc/locale.gen 2>/dev/null || {
+  echo "en_US.UTF-8 UTF-8" >> /etc/locale.gen
+}
+
+DEBIAN_FRONTEND=noninteractive locale-gen >/dev/null
+update-locale LANG=en_US.UTF-8
+ok "Locale set to en_US.UTF-8"
+
+# timezone
+timedatectl set-timezone Europe/Zurich
+ok "Timezone set to Europe/Zurich"
+
+systemctl disable networking --now 2>/dev/null || true
+systemctl disable NetworkManager --now 2>/dev/null || true
+
+section "Creating network configuration"
+mkdir -p /etc/systemd/network
+
+[ -f /etc/systemd/network/10-${INTERFACE}.network ] \
+  && warn "Existing network configuration will be replaced"
+
+if [ "$USE_DHCP" = "yes" ]; then
+cat > /etc/systemd/network/10-${INTERFACE}.network <<EOF
+[Match]
+Name=${INTERFACE}
+
+[Network]
+DHCP=yes
+EOF
+else
+cat > /etc/systemd/network/10-${INTERFACE}.network <<EOF
+[Match]
+Name=${INTERFACE}
+
+[Network]
+Address=${IP}
+Gateway=${GATEWAY}
+DNS=${DNS_SERVER}
+DHCP=no
+EOF
+fi
+
+section "Configuring systemd-resolved (Fallback DNS)"
+if [ "$USE_DHCP" != "yes" ]; then
+cat > /etc/systemd/resolved.conf <<EOF
+[Resolve]
+DNS=${DNS_SERVER}
+FallbackDNS=${FALLBACK_DNS}
+DNSSEC=no
+DNSOverTLS=no
+Cache=yes
+EOF
+else
+cat > /etc/systemd/resolved.conf <<EOF
+[Resolve]
+DNSSEC=no
+DNSOverTLS=no
+Cache=yes
+EOF
+fi
+
+section "Applying network"
+
+networkctl reload
+systemctl restart systemd-networkd
+
+systemctl restart systemd-resolved
+resolvectl flush-caches || true
+
+for i in {1..50}; do
+  [ -e /run/systemd/resolve/resolv.conf ] && break
+  sleep 0.2
+done
+
+[ -e /run/systemd/resolve/resolv.conf ] \
+  || { error "systemd-resolved resolv.conf not created"; exit 1; }
+
+rm -f /etc/resolv.conf
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+
+ok "network applied"
+
+section "Testing network connectivity"
+
+ip addr show "$INTERFACE"
+ip route
+
+if [ "$USE_DHCP" != "yes" ]; then
+  ping -c 2 "$GATEWAY" >/dev/null 2>&1 && ok "Gateway reachable" || warn "Gateway unreachable"
+else
+  DHCP_GW=$(ip route | awk '/default/ {print $3; exit}')
+  if [ -n "${DHCP_GW:-}" ]; then
+    ping -c 2 "$DHCP_GW" >/dev/null 2>&1 && ok "Gateway reachable" || warn "Gateway unreachable"
+  else
+    warn "No default gateway detected"
+  fi
+fi
+
+ping -c 2 8.8.8.8 >/dev/null 2>&1 && ok "Internet reachable" || warn "Internet unreachable"
+resolvectl query deb.debian.org >/dev/null 2>&1 && ok "DNS working" || warn "DNS resolution failed"
+
+echo
+section "Network Setup Complete"
+
+section "Configuring passwordless sudo"
+
+read -e -p "Enter admin user: " -i "hadzicni" SUDO_USER_NAME
+SUDO_FILE="/etc/sudoers.d/$SUDO_USER_NAME"
+
+id "$SUDO_USER_NAME" >/dev/null 2>&1 || {
+  error "User $SUDO_USER_NAME does not exist"
+  exit 1
+}
+
+echo "$SUDO_USER_NAME ALL=(ALL) NOPASSWD:ALL" > "$SUDO_FILE"
+chmod 440 "$SUDO_FILE"
+
+visudo -cf "$SUDO_FILE" >/dev/null || {
+  error "sudoers validation failed"
+  rm -f "$SUDO_FILE"
+  exit 1
+}
+
+ok "Passwordless sudo enabled for $SUDO_USER_NAME"
+
+section "Creating ansible user"
+
+ANSIBLE_USER="ansible"
+
+if id "$ANSIBLE_USER" >/dev/null 2>&1; then
+  warn "User $ANSIBLE_USER already exists"
+else
+  useradd -m -s /bin/bash -U "$ANSIBLE_USER"
+  ok "User $ANSIBLE_USER created"
+fi
+
+section "Preparing SSH for ansible"
+
+mkdir -p /home/ansible/.ssh
+chmod 700 /home/ansible/.ssh
+
+touch /home/ansible/.ssh/authorized_keys
+chmod 600 /home/ansible/.ssh/authorized_keys
+
+chown -R ansible:ansible /home/ansible/.ssh
+
+ok "SSH directory prepared for ansible"
+
+section "Configuring passwordless sudo for ansible"
+
+SUDO_FILE="/etc/sudoers.d/ansible"
+
+echo "ansible ALL=(ALL) NOPASSWD:ALL" > "$SUDO_FILE"
+chmod 440 "$SUDO_FILE"
+
+visudo -cf "$SUDO_FILE" >/dev/null || {
+  error "sudoers validation failed"
+  rm -f "$SUDO_FILE"
+  exit 1
+}
+
+ok "Passwordless sudo enabled for ansible"
+
+section "Adding SSH key for ansible"
+
+read -r -p "Paste SSH public key (leave empty to skip): " PUBKEY
+
+if [ -n "$PUBKEY" ]; then
+if ! grep -qxF "$PUBKEY" /home/ansible/.ssh/authorized_keys; then
+  echo "$PUBKEY" >> /home/ansible/.ssh/authorized_keys
+fi
+chown ansible:ansible /home/ansible/.ssh/authorized_keys
+ok "SSH key added"
+else
+warn "No SSH key added"
+fi
+
+section "Configuring SSH (enable key authentication)"
+
+SSHD_CONFIG="/etc/ssh/sshd_config"
+
+if grep -q "^#*PubkeyAuthentication" "$SSHD_CONFIG"; then
+sed -i 's/^#*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$SSHD_CONFIG"
+else
+echo "PubkeyAuthentication yes" >> "$SSHD_CONFIG"
+fi
+
+if grep -q "^#*AuthorizedKeysFile" "$SSHD_CONFIG"; then
+sed -i 's|^#*AuthorizedKeysFile.*|AuthorizedKeysFile .ssh/authorized_keys|' "$SSHD_CONFIG"
+else
+echo "AuthorizedKeysFile .ssh/authorized_keys" >> "$SSHD_CONFIG"
+fi
+
+systemctl restart ssh || systemctl restart sshd
+
+ok "SSH configured (key auth enabled)"
+
+section "Installing Node Exporter"
+apt install -y prometheus-node-exporter >/dev/null 2>&1
+systemctl enable --now prometheus-node-exporter
+curl -sf http://localhost:9100/metrics >/dev/null \
+  && ok "Node Exporter responding" \
+  || warn "Node Exporter not responding"
+ok "Node Exporter installed"
+
+section "All Tasks Completed"
+warn "Reboot recommended"
