@@ -6,11 +6,11 @@
 
 <br />
 
-Short, clear description of the project in one sentence.
+A small collection of shell scripts.
 
 [![License](https://img.shields.io/badge/license-LICENSE-lightgrey.svg)](#license)
 [![Status](https://img.shields.io/badge/status-active-success.svg)](#overview)
-[![Language](https://img.shields.io/badge/language-LANGUAGE-blue.svg)](#overview)
+[![Language](https://img.shields.io/badge/language-shell-blue.svg)](#overview)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](#contributing)
 
 <br />
